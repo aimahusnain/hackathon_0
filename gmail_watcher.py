@@ -7,6 +7,8 @@ import base64
 import json
 import os
 import pickle
+import re
+import sys
 import time
 import logging
 from datetime import datetime
@@ -21,17 +23,16 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
 
 from base_watcher import BaseWatcher
-from skills.plan_generator import PlanGenerator
-from skills.activity_logger import ActivityLogger
 
 
 class GmailWatcher(BaseWatcher):
     """
-    Watches Gmail for new unread emails and creates action items.
+    Watches Gmail for new unread emails from Primary category and intelligently filters them.
 
-    This class connects to Gmail API, monitors for new unread emails,
-    and automatically creates markdown files in the Obsidian vault
-    for each new email.
+    Monitors only Primary category emails (not Promotions/Social/Updates) and uses
+    keyword analysis to determine which ones require action (questions, requests, tasks).
+    Only creates files for emails that need action. Creates clean, modern markdown files
+    in the Needs_Action folder. Emails stay in Needs_Action until manually moved by the user.
 
     Attributes:
         SCOPES (List[str]): OAuth scopes for Gmail API access
@@ -82,10 +83,6 @@ class GmailWatcher(BaseWatcher):
         # Initialize authentication and cache
         self._load_processed_ids()
         self._authenticate()
-
-        # Initialize plan generator and activity logger
-        self._plan_generator = PlanGenerator(vault_path)
-        self._activity_logger = ActivityLogger(vault_path)
 
     @property
     def service(self):
@@ -195,7 +192,7 @@ class GmailWatcher(BaseWatcher):
         try:
             results = self._service.users().messages().list(
                 userId='me',
-                q='is:unread'
+                q='is:unread category:primary'
             ).execute()
 
             messages = results.get('messages', [])
@@ -222,13 +219,16 @@ class GmailWatcher(BaseWatcher):
 
     def create_action_file(self, message: Dict[str, Any]) -> Optional[Path]:
         """
-        Create a markdown file in Needs_Action for the email.
+        Create a markdown file in Needs_Action for the email if action is required.
+
+        Only creates a file if the email contains action indicators (questions,
+        requests, tasks, deadlines). Otherwise, marks as processed and skips.
 
         Args:
             message: Gmail message dictionary containing at least 'id'
 
         Returns:
-            Path to created file, or None if creation failed
+            Path to created file, or None if no action needed or creation failed
 
         Raises:
             KeyError: If message doesn't contain 'id'
@@ -252,8 +252,46 @@ class GmailWatcher(BaseWatcher):
             date = headers.get('Date', '')
             msg_id = message['id']
 
+            # Helper function to remove problematic Unicode characters
+            def sanitize_unicode(text):
+                """Remove zero-width and other problematic Unicode characters."""
+                if not text:
+                    return text
+                # Remove zero-width spaces and other invisible/problematic chars
+                text = text.replace('\u200b', '')  # Zero-width space
+                text = text.replace('\u200c', '')  # Zero-width non-joiner
+                text = text.replace('\u200d', '')  # Zero-width joiner
+                text = text.replace('\ufeff', '')  # Zero-width no-break space (BOM)
+                text = text.replace('\u00a0', ' ')  # Non-breaking space to regular space
+                return text
+
+            # Sanitize headers immediately after extraction
+            from_addr = sanitize_unicode(from_addr)
+            subject = sanitize_unicode(subject)
+            date = sanitize_unicode(date)
+
+            # Sanitize subject for use in markdown
+            subject = subject.replace('\r', '').replace('\n', ' ').strip()
+            if not subject:
+                subject = 'No Subject'
+
             # Get email body
             body = self._extract_body(msg)
+
+            # Sanitize body to remove problematic Unicode characters
+            body = sanitize_unicode(body)
+
+            # Check if email needs action
+            needs_action = self._email_needs_action(subject, body, from_addr)
+            # Sanitize subject for logging to avoid encoding issues
+            safe_subject = subject.encode('ascii', errors='replace').decode('ascii')
+            self._logger.info(f'Email "{safe_subject}" needs action: {needs_action}')
+
+            if not needs_action:
+                self._logger.info(f'Skipping email (no action required): {safe_subject}')
+                self._processed_ids.add(msg_id)
+                self._save_processed_ids()
+                return None
 
             # Detect priority
             priority = self._detect_priority(subject, body, from_addr)
@@ -261,86 +299,140 @@ class GmailWatcher(BaseWatcher):
             # Create timestamp
             timestamp = datetime.now().isoformat()
 
-            # Create markdown file
-            filename = f'EMAIL_{msg_id[:8]}.md'
+            # Generate descriptive filename (description < 30 chars)
+            # Use subject, truncate if necessary
+            description = subject.strip()
+
+            # Clean description for filename
+            # Remove special characters, keep alphanumeric and spaces
+            description = re.sub(r'[^\w\s-]', '', description)
+            # Replace multiple spaces with single space
+            description = re.sub(r'\s+', ' ', description)
+
+            # Truncate to 27 chars (leaving room for ... if needed)
+            if len(description) > 27:
+                description = description[:27].strip()
+
+            # Remove any remaining spaces and replace with hyphens
+            description = description.replace(' ', '-')
+            # Remove multiple consecutive hyphens
+            description = re.sub(r'-+', '-', description)
+            # Remove leading/trailing hyphens
+            description = description.strip('-')
+
+            # Create filename with message ID suffix for uniqueness
+            filename = f'EMAIL - {description}_{msg_id[:8]}.md'
             filepath = self._needs_action / filename
 
+            # If file already exists, update it instead of overwriting
+            if filepath.exists():
+                self._logger.info(f'File already exists, updating: {filename}')
+                return None
+
+            # Format priority with emoji
+            priority_emoji = {'high': '🔴', 'normal': '🟡', 'low': '🟢'}.get(priority, '🟡')
+
+            # Parse date to cleaner format
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(date)
+                clean_date = dt.strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                clean_date = date
+
+            # Build modern content
             content = f'''---
-type: email
 message_id: {msg_id}
 from: {from_addr}
 subject: {subject}
 received: {timestamp}
 priority: {priority}
-status: pending
 ---
 
-# Email: {subject}
+# {subject}
 
-## From
-{from_addr}
+**From:** {from_addr}
+**Date:** {clean_date}
+**Priority:** {priority_emoji} {priority.capitalize()}
 
-## Date
-{date}
+---
 
-## Priority
-{priority.upper()}
-
-## Email Content
 {body}
 
-## Suggested Actions
-- [ ] Read and understand the email
-- [ ] Draft response if needed
-- [ ] Flag for follow-up if required
-- [ ] Archive once processed
+---
 
-## Processing Notes
-<!-- Add notes here as you process the email -->
+## 💬 Your Reply
+
+*No reply sent yet*
+
+---
+
+**Last Updated:** {timestamp}
 '''
 
-            filepath.write_text(content)
+            # Validate content before writing
+            if not content or len(content.strip()) < 50:
+                self._logger.warning(f'Content too short or empty, skipping: {safe_subject}')
+                self._processed_ids.add(msg_id)
+                self._save_processed_ids()
+                return None
+
+            # Write file with explicit UTF-8 encoding using open() for better control
+            self._logger.info(f'About to write file: {filepath.name} (content length: {len(content)})')
+
+            try:
+                with open(filepath, 'w', encoding='utf-8', errors='replace') as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())  # Force write to disk
+
+                # Verify file was written correctly
+                if not filepath.exists():
+                    self._logger.error(f'File was not created: {filepath.name}')
+                    return None
+
+                file_size = filepath.stat().st_size
+                if file_size == 0:
+                    self._logger.error(f'File is empty after write: {filepath.name}')
+                    filepath.unlink()
+                    return None
+
+                self._logger.info(f'File written successfully: {filepath.name} ({file_size} bytes)')
+
+            except UnicodeEncodeError as ue:
+                self._logger.error(f'Unicode encoding error: {ue}')
+                # Fallback: try writing with ASCII replacement
+                try:
+                    content_safe = content.encode('ascii', errors='replace').decode('ascii')
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        f.write(content_safe)
+                        f.flush()
+                        os.fsync(f.fileno())
+                except Exception as e2:
+                    self._logger.error(f'Fallback encoding also failed: {e2}')
+                    raise
             self._processed_ids.add(msg_id)
             self._save_processed_ids()
 
             self._logger.info(f'Created action file: {filepath}')
 
-            # Log the email to activity logger
-            try:
-                self._activity_logger.log_email_received(
-                    msg_id=msg_id,
-                    from_addr=from_addr,
-                    subject=subject,
-                    priority=priority,
-                    action_file=filepath.name
-                )
-            except Exception as e:
-                self._logger.warning(f'Could not log email: {e}')
-
-            # Generate plan if email requires it
-            try:
-                plan_file = self._plan_generator.generate_plan(
-                    email_file=filepath,
-                    subject=subject,
-                    body=body,
-                    from_addr=from_addr,
-                    msg_id=msg_id
-                )
-                if plan_file:
-                    self._logger.info(f'Generated plan: {plan_file}')
-                    self._activity_logger.log_plan_created(
-                        plan_id=plan_file.stem,
-                        subject=subject,
-                        complexity=self._plan_generator.requires_plan(subject, body, from_addr)[1],
-                        source_email=filepath.name
-                    )
-            except Exception as e:
-                self._logger.warning(f'Could not generate plan: {e}')
-
             return filepath
 
         except Exception as e:
+            import traceback
             self._logger.error(f'Error creating action file: {e}')
+            self._logger.debug(f'Traceback: {traceback.format_exc()}')
+            # Clean up any partially created file
+            try:
+                if 'filepath' in locals() and filepath.exists():
+                    # Check if file is empty (blank file)
+                    if filepath.stat().st_size == 0:
+                        self._logger.warning(f'Removing blank file: {filepath.name}')
+                        filepath.unlink()
+                    else:
+                        self._logger.warning(f'File exists but not empty ({filepath.stat().st_size} bytes), keeping it')
+            except Exception as cleanup_error:
+                self._logger.debug(f'Cleanup error: {cleanup_error}')
             return None
 
     def _extract_body(self, message: Dict[str, Any]) -> str:
@@ -384,9 +476,44 @@ status: pending
             self._logger.error(f'Error extracting body: {e}')
             return message.get('snippet', '(Unable to extract content)')
 
+    def _email_needs_action(self, subject: str, body: str, from_addr: str) -> bool:
+        """
+        Determine if an email requires action based on content analysis.
+
+        Args:
+            subject: Email subject line
+            body: Email body content
+            from_addr: Sender email address
+
+        Returns:
+            True if email requires action, False otherwise
+        """
+        subject_lower = subject.lower()
+        body_lower = body.lower()
+        content = subject_lower + ' ' + body_lower
+
+        # Action-required indicators
+        action_indicators = [
+            # Questions
+            '?', 'question', 'help', 'assist',
+            # Requests
+            'please', 'can you', 'could you', 'would you', 'need you',
+            'required', 'request', 'review', 'approve',
+            # Tasks
+            'to do', 'todo', 'task', 'action', 'follow up', 'followup',
+            'respond', 'reply', 'call', 'meeting',
+            # Deadlines
+            'deadline', 'due', 'urgent', 'asap', 'immediately',
+            # Direct questions
+            'any update', 'update on', 'status of', 'what about',
+            'how about', 'when can', 'let me know'
+        ]
+
+        return any(indicator in content for indicator in action_indicators)
+
     def _detect_priority(self, subject: str, body: str, from_addr: str) -> str:
         """
-        Detect email priority based on content analysis.
+        Detect email priority based on content analysis and sender.
 
         Args:
             subject: Email subject line
@@ -400,128 +527,43 @@ status: pending
         body_lower = body.lower()
         content = subject_lower + ' ' + body_lower
 
-        # Urgent keywords
-        urgent_keywords = ['urgent', 'asap', 'immediately', 'emergency', 'critical']
+        # High priority: urgent keywords + time-sensitive
+        urgent_keywords = ['urgent', 'asap', 'immediately', 'emergency', 'critical',
+                          'deadline', 'time sensitive', 'important', 'priority']
         if any(kw in content for kw in urgent_keywords):
             return 'high'
 
-        # Normal emails
+        # High priority: direct questions requiring response
+        question_patterns = ['?', 'can you', 'could you', 'would you', 'please',
+                           'need your', 'waiting for', 'response needed']
+        if any(pattern in content for pattern in question_patterns):
+            # Check if from important sender (could be configured)
+            important_domains = ['@tahaamin', '@ceo', '@director', '@manager']
+            if any(domain in from_addr.lower() for domain in important_domains):
+                return 'high'
+            return 'normal'
+
+        # Normal priority: work-related content
+        work_keywords = ['meeting', 'review', 'approve', 'task', 'project',
+                        'report', 'update', 'follow up', 'action']
+        if any(kw in content for kw in work_keywords):
+            return 'normal'
+
+        # Low priority: informational, FYI, newsletters
+        low_priority = ['fyi', 'for your information', 'newsletter', 'update',
+                       'notification', 'automated', 'no response needed']
+        if any(kw in content for kw in low_priority):
+            return 'low'
+
         return 'normal'
-
-    def _check_and_move_completed_emails(self) -> None:
-        """
-        Check if emails in Needs_Action have been replied/read and move them to Done.
-
-        Iterates through all email files in Needs_Action, checks if the corresponding
-        email in Gmail is still unread, and moves read emails to the Done folder.
-        """
-        try:
-            email_files = list(self._needs_action.glob('EMAIL_*.md'))
-            if not email_files:
-                return
-
-            done_folder = self._vault_path / 'Done'
-            done_folder.mkdir(parents=True, exist_ok=True)
-
-            for email_file in email_files:
-                try:
-                    msg_id_match = self._extract_message_id_from_file(email_file)
-                    if not msg_id_match:
-                        continue
-
-                    is_unread = self._is_email_unread(msg_id_match)
-
-                    if not is_unread:
-                        self._move_email_to_done(email_file, done_folder)
-
-                except Exception as e:
-                    self._logger.error(f'Error processing file {email_file}: {e}')
-                    continue
-
-        except Exception as e:
-            self._logger.error(f'Error checking completed emails: {e}')
-
-    def _extract_message_id_from_file(self, file_path: Path) -> Optional[str]:
-        """
-        Extract message ID from email file frontmatter.
-
-        Args:
-            file_path: Path to the email markdown file
-
-        Returns:
-            Message ID string, or None if not found
-        """
-        content = file_path.read_text()
-        for line in content.split('\n'):
-            if line.startswith('message_id:'):
-                return line.split(':', 1)[1].strip()
-        return None
-
-    def _is_email_unread(self, msg_id: str) -> bool:
-        """
-        Check if an email is still unread in Gmail.
-
-        Args:
-            msg_id: Gmail message ID
-
-        Returns:
-            True if email is unread, False otherwise
-        """
-        try:
-            msg = self._service.users().messages().get(
-                userId='me',
-                id=msg_id,
-                format='metadata'
-            ).execute()
-
-            return any(label == 'UNREAD' for label in msg.get('labelIds', []))
-
-        except Exception as e:
-            self._logger.warning(f'Could not check email {msg_id}: {e}')
-            return False
-
-    def _move_email_to_done(self, email_file: Path, done_folder: Path) -> None:
-        """
-        Move an email file to the Done folder with status update.
-
-        Args:
-            email_file: Path to the email file
-            done_folder: Path to the Done folder
-        """
-        content = email_file.read_text()
-        updated_content = content.replace(
-            'status: pending',
-            f'status: completed\ncompleted_date: {datetime.now().isoformat()}'
-        )
-
-        dest_path = done_folder / email_file.name
-        dest_path.write_text(updated_content)
-        email_file.unlink()
-
-        self._logger.info(f'Moved completed email to Done: {email_file.name}')
-
-        # Log the completion to activity logger
-        try:
-            self._activity_logger.log_email_moved_to_done(
-                email_file=email_file.name,
-                completed_date=datetime.now().isoformat()
-            )
-        except Exception as e:
-            self._logger.warning(f'Could not log email completion: {e}')
 
     def run(self) -> None:
         """
-        Override run to include checking for completed emails.
+        Main loop to check for new emails and create action files.
 
-        Extends the base run method to also move completed emails to Done.
+        Keeps emails in Needs_Action until manually moved by user.
         """
         self._logger.info(f'Starting {self.__class__.__name__}')
-
-        # Log system startup
-        try:
-            self._activity_logger.log_system_event('Startup', 'Gmail Watcher started')
-        except Exception as e:
-            self._logger.warning(f'Could not log system startup: {e}')
 
         while True:
             try:
@@ -530,19 +572,8 @@ status: pending
                 for item in items:
                     self.create_action_file(item)
 
-                # Check for completed emails and move to Done
-                self._check_and_move_completed_emails()
-
             except Exception as e:
                 self._logger.error(f'Error in main loop: {e}')
-                try:
-                    self._activity_logger.log_error(
-                        error_type='Runtime Error',
-                        error_message=str(e),
-                        context=f'Gmail Watcher main loop'
-                    )
-                except Exception:
-                    pass
                 time.sleep(5)  # Wait before retrying to avoid rapid error loops
             time.sleep(self._check_interval)
 
@@ -558,9 +589,25 @@ status: pending
 
 
 if __name__ == '__main__':
+    # Setup logging with UTF-8 support
+    class UTF8StreamHandler(logging.StreamHandler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                msg = msg.encode('ascii', errors='replace').decode('ascii')
+                stream = self.stream
+                stream.write(msg + self.terminator)
+                self.flush()
+            except Exception:
+                self.handleError(record)
+
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            UTF8StreamHandler(sys.stdout),
+            logging.FileHandler('ai_employee.log', encoding='utf-8')
+        ]
     )
 
     vault = Path(__file__).parent / 'AI_Employee_Vault'

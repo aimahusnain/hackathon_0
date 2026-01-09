@@ -1,9 +1,5 @@
 # Company Handbook - AI Employee Rules
 
-> Operating procedures, communication protocols, and decision-making guidelines for the AI Employee system.
-
----
-
 ## General Principles
 
 ### Core Values

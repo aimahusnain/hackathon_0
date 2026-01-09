@@ -23,13 +23,28 @@ from gmail_watcher import GmailWatcher
 load_dotenv()
 
 
-# Setup logging
+# Setup logging with UTF-8 support for Windows
+import codecs
+
+# Create a custom stream handler that handles Unicode properly
+class UTF8StreamHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Ensure message is ASCII-safe for console output
+            msg = msg.encode('ascii', errors='replace').decode('ascii')
+            stream = self.stream
+            stream.write(msg + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('ai_employee.log')
+        UTF8StreamHandler(sys.stdout),
+        logging.FileHandler('ai_employee.log', encoding='utf-8')
     ]
 )
 logger = logging.getLogger('AI_Employee')
@@ -201,7 +216,7 @@ def create_vault_structure(vault_path: Path) -> None:
     logger.info('Creating vault structure...')
     vault_path.mkdir(parents=True, exist_ok=True)
 
-    folders = ['Inbox', 'Needs_Action', 'Done', 'Pending_Approval', 'Plans', 'Logs']
+    folders = ['Inbox', 'Needs_Action', 'Done', 'Pending_Approval']
     for folder in folders:
         (vault_path / folder).mkdir(exist_ok=True)
 
