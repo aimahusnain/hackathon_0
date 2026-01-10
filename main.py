@@ -17,7 +17,8 @@ from typing import List, Tuple, Optional
 import msvcrt  # Windows-specific for key detection
 from dotenv import load_dotenv
 
-from gmail_watcher import GmailWatcher
+from Watchers.gmail_watcher import GmailWatcher
+from Watchers.whatsapp_watcher import WhatsAppWatcher
 
 # Load environment variables from .env file
 load_dotenv()
@@ -64,13 +65,14 @@ class AIEmployeeManager:
         _threads (List[threading.Thread]): Private list of active threads
     """
 
-    def __init__(self, vault_path: str, enable_gmail: bool = True) -> None:
+    def __init__(self, vault_path: str, enable_gmail: bool = True, enable_whatsapp: bool = True) -> None:
         """
         Initialize the AI Employee manager.
 
         Args:
             vault_path: Path to the Obsidian vault
             enable_gmail: Whether to enable Gmail watcher (default: True)
+            enable_whatsapp: Whether to enable WhatsApp watcher (default: True)
 
         Raises:
             ValueError: If vault_path is invalid or no watchers are enabled
@@ -84,6 +86,9 @@ class AIEmployeeManager:
         if enable_gmail:
             self._initialize_gmail_watcher()
 
+        if enable_whatsapp:
+            self._initialize_whatsapp_watcher()
+
         if not self._watchers:
             raise ValueError("At least one watcher must be enabled")
 
@@ -95,7 +100,17 @@ class AIEmployeeManager:
             logger.info('Gmail Watcher initialized')
         except Exception as e:
             logger.warning(f'Could not initialize Gmail Watcher: {e}')
-            logger.info('To enable Gmail: Download credentials.json from Google Cloud Console')
+            logger.info('To enable Gmail: Set GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET in .env')
+
+    def _initialize_whatsapp_watcher(self) -> None:
+        """Initialize the WhatsApp watcher."""
+        try:
+            whatsapp_watcher = WhatsAppWatcher(str(self._vault_path))
+            self._watchers.append(('WhatsAppWatcher', whatsapp_watcher))
+            logger.info('WhatsApp Watcher initialized')
+        except Exception as e:
+            logger.warning(f'Could not initialize WhatsApp Watcher: {e}')
+            logger.info('To enable WhatsApp: Ensure Playwright is installed and run whatsapp_watcher.py once to scan QR')
 
     @property
     def vault_path(self) -> Path:
@@ -260,6 +275,11 @@ def parse_arguments() -> argparse.Namespace:
         help='Disable Gmail watcher'
     )
     parser.add_argument(
+        '--no-whatsapp',
+        action='store_true',
+        help='Disable WhatsApp watcher'
+    )
+    parser.add_argument(
         '--vault-path',
         default=None,
         help='Alias for --vault'
@@ -310,7 +330,8 @@ def main() -> None:
     try:
         manager = AIEmployeeManager(
             str(vault_path),
-            enable_gmail=not args.no_gmail
+            enable_gmail=not args.no_gmail,
+            enable_whatsapp=not args.no_whatsapp
         )
 
         setup_signal_handlers(manager)
