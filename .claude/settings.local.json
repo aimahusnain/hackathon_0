@@ -1,0 +1,44 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(ls:*)",
+      "Bash(del:*)",
+      "Bash(chcp:*)",
+      "Bash(dir:*)",
+      "Bash(copy:*)",
+      "Bash(pip install:*)",
+      "Bash(findstr:*)",
+      "Bash(cat:*)",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(if exist:*)",
+      "Bash(tasklist:*)",
+      "Bash(taskkill:*)"
+    ],
+    "block": [
+      "Read(.env)",
+      "Write(.env)",
+      "Edit(.env)",
+      "Bash(*.env)",
+      "Bash(*.env *)",
+      "Read(.env)",
+      "Write(chat_service_account.json)",
+      "Edit(chat_service_account.json)",
+      "Bash(*chat_service_account.json)",
+      "Bash(*chat_service_account.json *)",
+      "Read(Sessions/*)",
+      "Write(Sessions/*)",
+      "Edit(Sessions/*)"
+    ]
+  },
+  "security": {
+    "protectedFiles": [
+      ".env",
+      "chat_service_account.json",
+      "Sessions/*",
+      "*.pickle",
+      "ai_employee.log"
+    ],
+    "description": "AI Employee System - Protected configuration and sessions"
+  }
+}

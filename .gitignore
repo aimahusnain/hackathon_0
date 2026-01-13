@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+
+# AI Employee Vault
+/AI_Employee_Vault/.obsidian
+/AI_Employee_Vault/.gmail_cache.json
+/AI_Employee_Vault/.whatsapp_cache.json
+/AI_Employee_Vault/whatsapp_debug.png
+
+# Sessions folder (contains browser sessions and tokens)
+Sessions/
+token.pickle
+whatsapp_session/
+sessions/
+
+# Logs
+ai_employee.log
+*.log
+
+# MyPy cache
+.mypy_cache/
+chat_service_account.json
+nul
